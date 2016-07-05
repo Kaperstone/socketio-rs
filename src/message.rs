@@ -4,16 +4,18 @@
 
 use std::fmt::{Display, format, Formatter, Result as FmtResult};
 use std::io::{BufRead, Error as IoError, ErrorKind, Read, Result as IoResult, Write};
-use std::str::from_utf8;
+use std::str::{FromStr, from_utf8};
 use ::SocketError;
 use rustc_serialize::{Decodable, Encodable};
-use rustc_serialize::json::{Builder, Json, Parser};
+use rustc_serialize::json::{Builder, Json, Parser, ToJson};
 
 const ACK_PACKET_WITHOUT_ID: &'static str = "Received ack packet without an ID.";
+const ATTACHMENT_ARRAY_TOO_SHORT: &'static str = "Attachments could not be reattached because the attachment array was too short.";
 const BUFFER_UNEXPECTED_EOF: &'static str = "Packet type could not be read because the end of the buffer string was reached.";
 const MESSAGE_PACKET_ARRAY_MISSING: &'static str = "Packet could not be parsed because the message JSON data was not an array.";
 const MESSAGE_PACKET_ARRAY_TOO_SHORT: &'static str = "Packet could not be parsed because the data array did not contain enough elements.";
 const MESSAGE_PACKET_NAME_NOT_STRING: &'static str = "Packet could not be parsed because the array element that should've been the packet's name was not a string.";
+const UNREACHABLE_UNWRAP_FAILED: &'static str = "This unwrap while parsing a packet should never fail. Please contact the developers of NeoLegends/socketio-rs.";
 
 /// A socket.io message.
 #[derive(Clone, Debug, PartialEq)]
@@ -24,12 +26,55 @@ pub struct Message {
 
 impl Message {
     /// Constructs a new `Message` from a namespace and a body.
-    pub fn new(nsp: &str, body: Body) -> Message {
+    pub fn new(nsp: &str, body: Body) -> Self {
         Message::_new(nsp.to_owned(), body)
     }
 
+    /// Constructs a new `Message` with the default namespace.
+    pub fn with_default_namespace(body: Body) -> Self {
+        Message::new("/", body)
+    }
+
+    fn _new(nsp: String, body: Body) -> Self {
+        assert!(nsp.starts_with('/'));
+
+        Message {
+            body: body,
+            namespace: nsp
+        }
+    }
+
+    /// Gets the message's body.
+    pub fn body(&self) -> &Body {
+        &self.body
+    }
+
+    /// Gets the message's namespace.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Reattaches detached binary data that is sent after the packet.
+    ///
+    /// ## Remarks
+    /// - You generally shouldn't use this method yourself. Reattaching the
+    ///   binary attachments will be done by socketio-rs.
+    /// - Traverses the JSON tree up to a depth of 512 elements.
+    pub fn reconstruct(&mut self, attachments: &Vec<Vec<u8>>) -> Result<(), SocketError> {
+        if let Body::BinaryEvent { attachment_count, ref mut body, .. } = self.body {
+            assert!((attachment_count as usize) >= attachments.len(), "Not enough attachments!");
+            reconstruct(body, attachments, 512)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl FromStr for Message {
+    type Err = SocketError;
+
     /// Parses a `Message` from a string slice.
-    pub fn from_str(buf: &str) -> Result<Message, SocketError> {
+    fn from_str(buf: &str) -> Result<Self, Self::Err> {
         let mut chars = buf.chars().peekable();
         match chars.nth(0) {
             Some(ch @ '0' ... '6') => {
@@ -37,7 +82,7 @@ impl Message {
                     '5' | '6' => {
                         let att_c_res = chars.by_ref().take_while(|&ch| ch != '-')
                                                       .collect::<String>()
-                                                      .parse::<i32>();
+                                                      .parse::<u32>();
                         Some(try!(att_c_res))
                     },
                     _ => None
@@ -63,26 +108,31 @@ impl Message {
                     _ => None
                 };
 
-                Ok(match ch {
-                    '0' => Message::_new(nsp, Body::Connect),
-                    '1' => Message::_new(nsp, Body::Disconnect),
+                Ok(Message::_new(nsp, match ch {
+                    '0' => Body::Connect,
+                    '1' => Body::Disconnect,
                     '2' => {
-                        let (name, body) = try!(get_name_and_body(json_body.unwrap()));
-                        Message::_new(nsp, Body::Event {
+                        let (name, body) = try!(get_name_and_body(json_body.expect(UNREACHABLE_UNWRAP_FAILED)));
+                        Body::Event {
                             body: body,
                             id: id,
                             name: name
-                        })
+                        }
                     },
-                    '3' => Message::_new(nsp, Body::Ack(id.unwrap())),
-                    '4' => Message::_new(nsp, Body::Error(json_body.unwrap())),
+                    '3' => Body::Ack(id.expect(UNREACHABLE_UNWRAP_FAILED)),
+                    '4' => Body::Error(json_body.expect(UNREACHABLE_UNWRAP_FAILED)),
                     '5' => {
-                        let (name, body) = try!(get_name_and_body(json_body.unwrap()));
-                        unimplemented!()
+                        let (name, body) = try!(get_name_and_body(json_body.expect(UNREACHABLE_UNWRAP_FAILED)));
+                        Body::BinaryEvent {
+                            attachment_count: att_count.unwrap(),
+                            body: body,
+                            id: id,
+                            name: name
+                        }
                     },
-                    '6' => Message::_new(nsp, Body::BinaryAck(id.unwrap())),
+                    '6' => Body::BinaryAck(id.unwrap()),
                     _ => unreachable!("This packet type case should never be reached since the parent match should already catch it.")
-                })
+                }))
             },
             Some(ch) => {
                 let msg = format(format_args!("Message type could not be parsed because an illegal character was read: '{}'. Legal values are in the range of [0, 6].", ch));
@@ -90,30 +140,6 @@ impl Message {
             },
             None => Err(SocketError::Io(IoError::new(ErrorKind::UnexpectedEof, BUFFER_UNEXPECTED_EOF)))
         }
-    }
-
-    /// Constructs a new `Message` with the default namespace.
-    pub fn with_default_namespace(body: Body) -> Message {
-        Message::new("/", body)
-    }
-
-    fn _new(nsp: String, body: Body) -> Message {
-        assert!(nsp.starts_with('/'));
-
-        Message {
-            body: body,
-            namespace: nsp
-        }
-    }
-
-    /// Gets the message's body.
-    pub fn body(&self) -> &Body {
-        &self.body
-    }
-
-    /// Gets the message's namespace.
-    pub fn namespace(&self) -> &str {
-        &self.namespace
     }
 }
 
@@ -141,6 +167,7 @@ pub enum Body {
 
     /// A socket message containing binary data.
     BinaryEvent {
+        attachment_count: u32,
         body: Json,
         id: Option<i32>,
         name: String
@@ -148,6 +175,16 @@ pub enum Body {
 
     /// An ack response for binary messages.
     BinaryAck(i32)
+}
+
+/// Recursively reconstructs the given JSON message according to socket.io rules.
+///
+/// ## Parameters
+/// - `body: &mut Json`: The JSON message to reconstruct.
+/// - `attachments: &Vec<Vec<u8>>`: The binary attachments.
+/// - `max_depth: u32`: The maximum depth to search for placeholders in.
+pub fn reconstruct(body: &mut Json, attachments: &Vec<Vec<u8>>, max_depth: u32) -> Result<(), SocketError> {
+    _reconstruct(body, attachments, max_depth, 0)
 }
 
 fn get_name_and_body(json_body: Json) -> Result<(String, Json), SocketError> {
@@ -171,7 +208,106 @@ fn get_name_and_body(json_body: Json) -> Result<(String, Json), SocketError> {
     Ok((name, body))
 }
 
+fn _reconstruct(body: &mut Json, attachments: &Vec<Vec<u8>>, max_depth: u32, depth: u32) -> Result<(), SocketError> {
+    if depth >= max_depth {
+        return Ok(());
+    }
+
+    if body.is_object() {
+        // We do not use destructuring here because then the hash map would be
+        // borrowed for the entire block and we couldn't replace the placeholder
+        // with the binary data.
+        // Hoping for #811 to land soon.
+
+        let possible_index = {
+            let map = body.as_object().expect(UNREACHABLE_UNWRAP_FAILED);
+            if let Some(&Json::Boolean(true)) = map.get("_placeholder") {
+                match map.get("num") {
+                    Some(&Json::U64(num)) => Some(num as usize),
+                    Some(&Json::I64(num)) => Some(num as usize),
+                    _ => None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(index) = possible_index { // We're dealing with a placeholder
+            if let Some(vec) = attachments.get(index) {
+                *body = vec.to_json();
+                Ok(())
+            } else {
+                // This case should hopefully never happen in real life, since
+                // we're controlling the length of the binary array before reconstructing.
+                // Might happen in some edge cases though. Yet we're not panicing here
+                // since we're dealing with invalid JSON and not a bug in the code.
+                Err(SocketError::invalid_data(ATTACHMENT_ARRAY_TOO_SHORT))
+            }
+        } else { // We're dealing with a top-level object, need to search through the children
+            if let Json::Object(ref mut map) = *body {
+                for value in map.values_mut() {
+                    try!(_reconstruct(value, attachments, max_depth, depth + 1));
+                }
+                Ok(())
+            } else {
+                unreachable!(UNREACHABLE_UNWRAP_FAILED);
+            }
+        }
+    } else if let Json::Array(ref mut arr) = *body {
+        for value in arr.iter_mut() {
+            try!(_reconstruct(value, attachments, max_depth, depth + 1));
+        }
+        Ok(())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{get_name_and_body};
+    use std::collections::BTreeMap;
+    use rustc_serialize::json::ToJson;
+
+    #[test]
+    fn reconstruct_1() {
+        let mut object1 = BTreeMap::new();
+        object1.insert("_placeholder".to_owned(), true.to_json());
+        object1.insert("num".to_owned(), 0.to_json());
+
+        let object2 = object1.clone();
+        let mut objects = vec![object1.to_json(), object2.to_json()].to_json();
+        let b_data = vec![vec![1u8, 2u8, 3u8], vec![4u8, 5u8, 6u8]];
+
+        reconstruct(&mut objects, &b_data, 512).expect("Inserting the attachments failed.");
+
+        let ideal_result = vec![
+            vec![1u64.to_json(), 2u64.to_json(), 3u64.to_json()].to_json(),
+            vec![1u64.to_json(), 2u64.to_json(), 3u64.to_json()].to_json()
+        ].to_json();
+        assert_eq!(objects, ideal_result);
+    }
+
+    #[test]
+    fn reconstruct_2() {
+        let mut placeholder = BTreeMap::new();
+        placeholder.insert("_placeholder".to_owned(), true.to_json());
+        placeholder.insert("num".to_owned(), 0.to_json());
+
+        let mut object = BTreeMap::new();
+        object.insert("member1".to_owned(), true.to_json());
+        object.insert("b_data".to_owned(), placeholder.to_json());
+        let mut object = object.to_json();
+
+        let b_data = vec![vec![1u8, 2u8, 3u8]];
+
+        reconstruct(&mut object, &b_data, 512).expect("Inserting the attachments failed.");
+
+        let mut ideal_result = BTreeMap::new();
+        ideal_result.insert("member1".to_owned(), true.to_json());
+        ideal_result.insert("b_data".to_owned(), vec![1u8.to_json(), 2u8.to_json(), 3u8.to_json()].to_json());
+
+        assert_eq!(object, ideal_result.to_json());
+    }
 }

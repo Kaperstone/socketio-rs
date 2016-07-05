@@ -31,6 +31,12 @@ pub enum SocketError {
 
 impl SocketError {
     /// Creates an `InvalidData`-variant.
+    ///
+    /// ## Example
+    /// ```
+    /// # use socketio::SocketError;
+    /// let e = SocketError::invalid_data("Data was invalid.");
+    /// ```
     pub fn invalid_data<E: Into<Box<Error + Send + Sync>>>(err: E) -> SocketError {
         SocketError::Io(IoError::new(ErrorKind::InvalidData, err))
     }
