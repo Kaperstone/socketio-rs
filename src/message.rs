@@ -18,7 +18,7 @@ const MESSAGE_PACKET_NAME_NOT_STRING: &'static str = "Packet could not be parsed
 const UNREACHABLE_UNWRAP_FAILED: &'static str = "This unwrap while parsing a packet should never fail. Please contact the developers of NeoLegends/socketio-rs.";
 
 /// A socket.io message.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, RustcEncodable)]
 pub struct Message {
     body: Body,
     namespace: String
@@ -61,9 +61,9 @@ impl Message {
     ///   binary attachments will be done by socketio-rs.
     /// - Traverses the JSON tree up to a depth of 512 elements.
     pub fn reconstruct(&mut self, attachments: &Vec<Vec<u8>>) -> Result<(), SocketError> {
-        if let Body::BinaryEvent { attachment_count, ref mut body, .. } = self.body {
+        if let Body::BinaryEvent { attachment_count, ref mut data, .. } = self.body {
             assert!((attachment_count as usize) >= attachments.len(), "Not enough attachments!");
-            reconstruct(body, attachments, 512)
+            reconstruct(data, attachments, 512)
         } else {
             Ok(())
         }
@@ -114,7 +114,7 @@ impl FromStr for Message {
                     '2' => {
                         let (name, body) = try!(get_name_and_body(json_body.expect(UNREACHABLE_UNWRAP_FAILED)));
                         Body::Event {
-                            body: body,
+                            data: body,
                             id: id,
                             name: name
                         }
@@ -125,7 +125,7 @@ impl FromStr for Message {
                         let (name, body) = try!(get_name_and_body(json_body.expect(UNREACHABLE_UNWRAP_FAILED)));
                         Body::BinaryEvent {
                             attachment_count: att_count.unwrap(),
-                            body: body,
+                            data: body,
                             id: id,
                             name: name
                         }
@@ -144,7 +144,7 @@ impl FromStr for Message {
 }
 
 /// The body of a socket.io message.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, RustcEncodable)]
 pub enum Body {
     /// Sent to the server in order to connect to a new namespace.
     Connect,
@@ -154,7 +154,7 @@ pub enum Body {
 
     /// An actual socket message / event.
     Event {
-        body: Json,
+        data: Json,
         id: Option<i32>,
         name: String
     },
@@ -168,7 +168,7 @@ pub enum Body {
     /// A socket message containing binary data.
     BinaryEvent {
         attachment_count: u32,
-        body: Json,
+        data: Json,
         id: Option<i32>,
         name: String
     },
@@ -271,7 +271,57 @@ mod tests {
     use rustc_serialize::json::ToJson;
 
     #[test]
-    fn reconstruct_1() {
+    fn name_and_body() {
+        let j_data = vec!["Hello".to_json(), vec![1, 2, 3, 4, 5, 6].to_json()].to_json();
+        let (name, body) = get_name_and_body(j_data).expect("Failed to get name and body.");
+
+        assert_eq!(&name, "Hello");
+        assert_eq!(body, vec![1, 2, 3, 4, 5, 6].to_json());
+    }
+
+    #[test]
+    fn parse_str() {
+        let s = r#"2["test-s-string",{"server":"Hello"}]"#;
+        let m = s.parse::<Message>().expect("Failed to parse message from string.");
+
+        assert_eq!("/", m.namespace());
+        if let Body::Event { ref data, id, ref name } = *m.body() {
+            let mut object = BTreeMap::new();
+            object.insert("server".to_owned(), "Hello".to_json());
+            let object = object.to_json();
+
+            assert_eq!(name, "test-s-string");
+            assert_eq!(id, None);
+            assert_eq!(data.clone(), object);
+        } else {
+            panic!("Message body wasn't an event body.");
+        }
+    }
+
+    #[test]
+    fn parse_str_and_reconstruct() {
+        let s = r#"52-["test-s-buf",[{"_placeholder":true,"num":0},{"_placeholder":true,"num":1}]]"#;
+        let mut m = s.parse::<Message>().expect("Failed to parse message from string.");
+        let b_data = vec![vec![1u8, 2u8, 3u8], vec![4u8, 5u8, 6u8]];
+        m.reconstruct(&b_data).expect("Reconstructing failed.");
+
+        assert_eq!("/", m.namespace());
+        if let Body::BinaryEvent { attachment_count, ref data, id, ref name } = *m.body() {
+            let j_b_data = b_data.to_json();
+
+            assert_eq!(attachment_count, 2);
+            assert_eq!(name, "test-s-buf");
+            assert_eq!(id, None);
+            assert_eq!(data.clone(), j_b_data);
+
+            println!("{:?}\n{:?}", m, j_b_data);
+        } else {
+            panic!("Message body wasn't a binary event body.");
+        }
+    }
+
+    #[test]
+    fn reconstruct_raw_1() {
         let mut object1 = BTreeMap::new();
         object1.insert("_placeholder".to_owned(), true.to_json());
         object1.insert("num".to_owned(), 0.to_json());
@@ -282,15 +332,12 @@ mod tests {
 
         reconstruct(&mut objects, &b_data, 512).expect("Inserting the attachments failed.");
 
-        let ideal_result = vec![
-            vec![1u64.to_json(), 2u64.to_json(), 3u64.to_json()].to_json(),
-            vec![1u64.to_json(), 2u64.to_json(), 3u64.to_json()].to_json()
-        ].to_json();
+        let ideal_result = vec![vec![1u64, 2u64, 3u64], vec![1u64, 2u64, 3u64]].to_json();
         assert_eq!(objects, ideal_result);
     }
 
     #[test]
-    fn reconstruct_2() {
+    fn reconstruct_raw_2() {
         let mut placeholder = BTreeMap::new();
         placeholder.insert("_placeholder".to_owned(), true.to_json());
         placeholder.insert("num".to_owned(), 0.to_json());
